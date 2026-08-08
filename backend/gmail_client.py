@@ -9,6 +9,7 @@ Handles two things:
 
 import os
 import re
+import html
 import base64
 import requests
 
@@ -72,23 +73,62 @@ def _decode_part(data):
     return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
 
 
-def _strip_html(html):
-    text = re.sub(r"<[^>]+>", " ", html)
+def _remove_html_blockquotes(html_text):
+    """Gmail wraps a message's entire quoted history in a <blockquote>,
+    placed AFTER the person's actual new reply text. Cutting the HTML off
+    at the first <blockquote> keeps only the new content -- far more
+    reliable than trying to regex-match nested blockquote pairs."""
+    match = re.search(r"<blockquote", html_text, re.IGNORECASE)
+    return html_text[: match.start()] if match else html_text
+
+
+def _strip_html(html_text):
+    html_text = _remove_html_blockquotes(html_text)
+    text = re.sub(r"<[^>]+>", " ", html_text)
+    text = html.unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _strip_quoted_reply(text):
+    """Drop quoted-reply boilerplate: lines starting with '>' (the quoted
+    original message) and "On <date>, <name> wrote:" attribution lines --
+    Gmail includes both every time someone replies, which otherwise makes
+    matched snippets an unreadable wall of repeated, nested quotes."""
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            continue
+        if re.match(r"^On .*wrote:\s*$", stripped, re.IGNORECASE):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
 def _extract_text_from_payload(payload):
     """Recursively pull plain text out of a (possibly multipart) message
     payload, falling back to stripped HTML if that's all there is."""
-    texts = []
     mime_type = payload.get("mimeType", "")
-    body_data = payload.get("body", {}).get("data")
     parts = payload.get("parts", [])
 
+    if mime_type == "multipart/alternative":
+        # Gmail sends most messages as BOTH plain text and HTML versions of
+        # the *same* content. Pick just one (prefer plain text) instead of
+        # extracting both, or every message ends up duplicated.
+        plain_parts = [p for p in parts if p.get("mimeType") == "text/plain"]
+        if plain_parts:
+            return _extract_text_from_payload(plain_parts[0])
+        html_parts = [p for p in parts if p.get("mimeType") == "text/html"]
+        if html_parts:
+            return _extract_text_from_payload(html_parts[0])
+
+    body_data = payload.get("body", {}).get("data")
+    texts = []
     if mime_type == "text/plain" and body_data:
         texts.append(_decode_part(body_data))
-    elif mime_type == "text/html" and body_data and not parts:
+    elif mime_type == "text/html" and body_data:
         texts.append(_strip_html(_decode_part(body_data)))
 
     for part in parts:
@@ -114,6 +154,9 @@ def get_thread_full_text(access_token, thread_id):
     message_blocks = []
     for message in thread.get("messages", []):
         texts = _extract_text_from_payload(message.get("payload", {}))
-        message_blocks.append("\n".join(texts).strip())
+        raw_text = "\n".join(texts).strip()
+        cleaned_text = _strip_quoted_reply(raw_text).strip()
+        if cleaned_text:
+            message_blocks.append(cleaned_text)
 
-    return "\n\n---\n\n".join(block for block in message_blocks if block)
+    return "\n\n---\n\n".join(message_blocks)

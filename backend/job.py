@@ -2,17 +2,19 @@
 InboxCopilot scheduled job.
 
 Not a web server -- GitHub Actions runs this directly on a cron schedule
-(Task 9). For now (Task 6) it does two things:
+(Task 9). So far it:
 
   1. Finishes any pending "Connect Gmail" flow: exchanges the one-time
      authorization code the frontend captured for a long-lived refresh
      token, and stores that on the user's Firestore doc.
   2. For every active watch task belonging to a connected user, fetches
      the full text of recent threads from that task's sender -- trailing
-     replies included -- and logs them.
+     replies included.
+  3. Scans that text for the task's keyword and prints just the relevant
+     sentence(s), instead of the whole thread.
 
-Keyword-matching (Task 7) and actually sending alerts (Task 8) come next;
-this task's job is just proving the pipeline can read real Gmail data.
+Actually sending alerts (Task 8) and running this on a real schedule
+(Task 9) come next.
 """
 
 from dotenv import load_dotenv
@@ -26,6 +28,7 @@ from gmail_client import (
     list_thread_ids_from_sender,
     get_thread_full_text,
 )
+from matcher import find_relevant_sentences
 
 
 def connect_pending_gmail(db, user_doc):
@@ -88,10 +91,16 @@ def process_user_tasks(db, uid, user_data):
 
         for thread_id in thread_ids:
             full_text = get_thread_full_text(access_token, thread_id)
-            preview = full_text[:200].replace("\n", " ")
-            print(f"    [{thread_id}] {preview}...")
-            # Task 7 will scan `full_text` for `keyword` here.
-            # Task 8 will send an alert if it's a genuine, new match.
+            matches = find_relevant_sentences(full_text, keyword)
+
+            if matches:
+                print(f"    \u2713 MATCH in thread [{thread_id}]:")
+                for snippet in matches:
+                    print(f"        - {snippet}")
+                # Task 8 will send an alert for genuinely NEW matches here
+                # (dedup against already-notified message/thread ids).
+            else:
+                print(f"    (no mention of '{keyword}' in thread [{thread_id}])")
 
 
 def main():
